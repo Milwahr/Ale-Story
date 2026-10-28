@@ -3,6 +3,8 @@ import { deleteEntry, getEntries, saveEntry, type Attachment, type JournalEntry 
 
 type Draft = Pick<JournalEntry, 'date' | 'title' | 'location' | 'body' | 'attachments'>
 
+const entryCode = '1313'
+const maxImageSize = 2 * 1024 * 1024
 const today = () => new Date().toISOString().slice(0, 10)
 const makeDraft = (): Draft => ({ date: today(), title: '', location: '', body: '', attachments: [] })
 const makeId = () => crypto.randomUUID()
@@ -33,6 +35,8 @@ function App() {
   const [isComposerOpen, setComposerOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draft, setDraft] = useState<Draft>(makeDraft)
+  const [enteredCode, setEnteredCode] = useState('')
+  const [imageWarning, setImageWarning] = useState('')
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
 
@@ -54,11 +58,15 @@ function App() {
   function startNewEntry() {
     setEditingId(null)
     setDraft(makeDraft())
+    setEnteredCode('')
+    setImageWarning('')
     setComposerOpen(true)
   }
 
   function startEditing(entry: JournalEntry) {
     setEditingId(entry.id)
+    setEnteredCode('')
+    setImageWarning('')
     setDraft({
       date: entry.date,
       title: entry.title,
@@ -73,10 +81,17 @@ function App() {
     setComposerOpen(false)
     setEditingId(null)
     setDraft(makeDraft())
+    setEnteredCode('')
+    setImageWarning('')
   }
 
   async function submitEntry(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (!editingId && enteredCode !== entryCode) {
+      setError('Enter the correct entry code before posting.')
+      return
+    }
+
     const existing = entries.find((entry) => entry.id === editingId)
     const timestamp = Date.now()
     const entry: JournalEntry = {
@@ -114,7 +129,12 @@ function App() {
   }
 
   function addImages(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('image/'))
+    const selectedImages = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('image/'))
+    const files = selectedImages.filter((file) => file.size <= maxImageSize)
+    const oversizedCount = selectedImages.length - files.length
+    setImageWarning(oversizedCount > 0
+      ? `${oversizedCount} image${oversizedCount === 1 ? '' : 's'} exceeded 2 MB and ${oversizedCount === 1 ? 'was' : 'were'} not attached.`
+      : '')
     setDraft((current) => ({
       ...current,
       attachments: [...current.attachments, ...files.map((file) => ({
@@ -133,7 +153,7 @@ function App() {
       <header className="topbar">
         <a className="brand" href="#top" aria-label="Stone and Story home">
           <span className="brand-mark" aria-hidden="true"><i /><b /></span>
-          <span className="brand-copy"><strong>STONE <em>&</em> STORY</strong><small>FIELD CHRONICLE</small></span>
+          <span className="brand-copy"><strong>STONE <em>&</em> STORY</strong><small>THE MOUNTAIN'S CHRONICLES</small></span>
         </a>
         <div className="topbar-right">
           <span className="realm-label"><span className="status-dot" /> PERSONAL ARCHIVE</span>
@@ -159,9 +179,9 @@ function App() {
 
         <main className="main-content">
           <section className="page-intro">
-            <div className="eyebrow"><span /> A DWARF'S TALE, ONE MILE AT A TIME</div>
+            <div className="eyebrow"><span /> A DWARF'S TALE, ONE STEP AT A TIME</div>
             <div className="intro-row">
-              <div><h1>The Long Way <i>Home</i></h1><p>Every road leaves a story. Keep yours here.</p></div>
+              <div><h1>The Long Way Across <i>Azeroth</i></h1><p>Every road leaves a story. Keep yours here.</p></div>
               <button className="button button-copper intro-new" onClick={startNewEntry}><span aria-hidden="true">+</span> Write an entry</button>
             </div>
           </section>
@@ -211,9 +231,12 @@ function App() {
               <div className="form-row"><label className="field">DATE<input type="date" required value={draft.date} onChange={(event) => setDraft({ ...draft, date: event.target.value })} /></label><label className="field">PLACE<input value={draft.location} onChange={(event) => setDraft({ ...draft, location: event.target.value })} placeholder="e.g. The Great Forge" maxLength={70} /></label></div>
               <label className="field">ENTRY TITLE<input autoFocus required value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="What happened out there?" maxLength={100} /></label>
               <label className="field">THE TALE<textarea required rows={7} value={draft.body} onChange={(event) => setDraft({ ...draft, body: event.target.value })} placeholder="The road, the company, the moment you want to keep..." maxLength={6000} /></label>
+              {!editingId && <label className="field">ENTRY CODE<input type="password" inputMode="numeric" pattern="[0-9]{4}" autoComplete="off" required maxLength={4} value={enteredCode} onChange={(event) => setEnteredCode(event.target.value.replace(/\D/g, '').slice(0, 4))} aria-describedby="entry-code-hint" /><small id="entry-code-hint" className={enteredCode.length === 4 && enteredCode !== entryCode ? 'code-hint code-hint-error' : 'code-hint'}>{enteredCode.length === 4 && enteredCode !== entryCode ? 'That code does not match.' : 'Enter the four-digit code to enable posting.'}</small></label>}
               <div className="attachment-heading"><span className="field-caption">KEEPSAKES</span><span className="attachment-hint">{draft.attachments.length} attached</span></div>
+              <p className="image-size-warning">Maximum image size: 2 MB per image.</p>
+              {imageWarning && <p className="image-size-warning image-size-warning-error" role="alert">{imageWarning}</p>}
               {draft.attachments.length > 0 && <div className="draft-photos">{draft.attachments.map((image) => <div className="draft-photo-wrap" key={image.id}><Photo attachment={image} className="draft-photo" /><button type="button" onClick={() => removeImage(image.id)} aria-label={`Remove ${image.name}`}>×</button></div>)}</div>}
-              <div className="composer-bottom"><label className="button button-outline upload-button"><span aria-hidden="true">▧</span> Add images<input type="file" accept="image/*" multiple onChange={addImages} /></label><span className="local-note">Images stay in this browser</span><button className="button button-copper save-button" type="submit">{editingId ? 'Save changes' : 'Inscribed'} <span aria-hidden="true">→</span></button></div>
+              <div className="composer-bottom"><label className="button button-outline upload-button"><span aria-hidden="true">▧</span> Add images<input type="file" accept="image/*" multiple onChange={addImages} /></label><span className="local-note">Images stay in this browser</span><button className="button button-copper save-button" type="submit" disabled={!editingId && enteredCode !== entryCode}>{editingId ? 'Save changes' : 'Carve Entry'} <span aria-hidden="true">→</span></button></div>
             </form>
           </section>
         </div>
