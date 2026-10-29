@@ -1,10 +1,14 @@
 import { useEffect, useState, type FormEvent, type ChangeEvent } from 'react'
-import { deleteEntry, getEntries, saveEntry, type Attachment, type JournalEntry } from './db'
+import type { User } from '@supabase/supabase-js'
+import { deleteEntry, getEntries, saveEntry } from './cloudDb'
+import { getEntries as getLocalEntries } from './db'
+import type { Attachment, JournalEntry } from './db'
+import { isSupabaseConfigured, supabase } from './supabase'
 
 type Draft = Pick<JournalEntry, 'date' | 'title' | 'location' | 'body' | 'attachments'>
 
-const entryCode = '1313'
 const maxImageSize = 2 * 1024 * 1024
+const supportedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'])
 const today = () => new Date().toISOString().slice(0, 10)
 const makeDraft = (): Draft => ({ date: today(), title: '', location: '', body: '', attachments: [] })
 const makeId = () => crypto.randomUUID()
@@ -19,10 +23,14 @@ function Photo({ attachment, className = '' }: { attachment: Attachment; classNa
   const [source, setSource] = useState('')
 
   useEffect(() => {
+    if (!attachment.blob) {
+      setSource(attachment.url ?? '')
+      return
+    }
     const url = URL.createObjectURL(attachment.blob)
     setSource(url)
     return () => URL.revokeObjectURL(url)
-  }, [attachment.blob])
+  }, [attachment.blob, attachment.url])
 
   return source
     ? <img className={className} src={source} alt={attachment.name} />
@@ -31,11 +39,17 @@ function Photo({ attachment, className = '' }: { attachment: Attachment; classNa
 
 function App() {
   const [entries, setEntries] = useState<JournalEntry[]>([])
+  const [localEntries, setLocalEntries] = useState<JournalEntry[]>([])
+  const [user, setUser] = useState<User | null>(null)
+  const [authReady, setAuthReady] = useState(false)
   const [search, setSearch] = useState('')
   const [isComposerOpen, setComposerOpen] = useState(false)
+  const [isAuthOpen, setAuthOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draft, setDraft] = useState<Draft>(makeDraft)
-  const [enteredCode, setEnteredCode] = useState('')
+  const [authEmail, setAuthEmail] = useState('')
+  const [isSendingLink, setSendingLink] = useState(false)
+  const [isImporting, setImporting] = useState(false)
   const [imageWarning, setImageWarning] = useState('')
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
@@ -45,9 +59,41 @@ function App() {
   }
 
   useEffect(() => {
-    refreshEntries().catch(() => setError('The journal could not open its local archive.'))
+    if (!supabase) {
+      setAuthReady(true)
+      setError('Cloud storage is not configured. Add your Supabase URL and public key to .env.local, then reload the site.')
+      return
+    }
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null)
+      setAuthReady(true)
+    })
+
+    void supabase.auth.getSession().then(({ data, error: sessionError }) => {
+      if (sessionError) throw sessionError
+      setUser(data.session?.user ?? null)
+      setAuthReady(true)
+    }).catch((loadError: unknown) => {
+      setAuthReady(true)
+      setError(loadError instanceof Error ? loadError.message : 'Could not restore your sign-in session.')
+    })
+
+    void refreshEntries().catch((loadError: unknown) => {
+      setError(loadError instanceof Error ? loadError.message : 'The public chronicle could not be loaded.')
+    })
+    void getLocalEntries().then(setLocalEntries).catch((loadError: unknown) => {
+      setError(loadError instanceof Error
+        ? `Could not check this browser for older entries: ${loadError.message}`
+        : 'Could not check this browser for older entries.')
+    })
+
+    return () => subscription.unsubscribe()
   }, [])
 
+  const unimportedEntries = user
+    ? localEntries.filter((localEntry) => !entries.some((entry) => entry.id === localEntry.id && entry.ownerId === user.id))
+    : []
   const visibleEntries = entries.filter((entry) => {
     const query = search.trim().toLocaleLowerCase()
     return !query || [entry.title, entry.location, entry.body].some((value) => value.toLocaleLowerCase().includes(query))
@@ -56,16 +102,19 @@ function App() {
   const photoCount = entries.reduce((total, entry) => total + entry.attachments.length, 0)
 
   function startNewEntry() {
+    if (!user) {
+      setAuthOpen(true)
+      return
+    }
     setEditingId(null)
     setDraft(makeDraft())
-    setEnteredCode('')
     setImageWarning('')
     setComposerOpen(true)
   }
 
   function startEditing(entry: JournalEntry) {
+    if (!user || entry.ownerId !== user.id) return
     setEditingId(entry.id)
-    setEnteredCode('')
     setImageWarning('')
     setDraft({
       date: entry.date,
@@ -81,14 +130,73 @@ function App() {
     setComposerOpen(false)
     setEditingId(null)
     setDraft(makeDraft())
-    setEnteredCode('')
     setImageWarning('')
+  }
+
+  async function requestSignIn(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!supabase) return
+    setSendingLink(true)
+    setError('')
+    try {
+      const { error: signInError } = await supabase.auth.signInWithOtp({
+        email: authEmail.trim(),
+        options: { emailRedirectTo: window.location.origin + window.location.pathname },
+      })
+      if (signInError) throw signInError
+      setAuthOpen(false)
+      setAuthEmail('')
+      setMessage('Check your email for a secure sign-in link.')
+      window.setTimeout(() => setMessage(''), 5000)
+    } catch (signInError) {
+      setError(signInError instanceof Error ? signInError.message : 'Could not send the sign-in link.')
+    } finally {
+      setSendingLink(false)
+    }
+  }
+
+  async function signOut() {
+    if (!supabase) return
+    const { error: signOutError } = await supabase.auth.signOut()
+    if (signOutError) {
+      setError(`Could not sign out: ${signOutError.message}`)
+      return
+    }
+    setMessage('You have signed out.')
+    window.setTimeout(() => setMessage(''), 2600)
+  }
+
+  async function importLocalArchive() {
+    if (!user || unimportedEntries.length === 0) return
+    setImporting(true)
+    setError('')
+    let importedCount = 0
+    try {
+      for (const entry of unimportedEntries) {
+        await saveEntry({ ...entry, ownerId: user.id }, user.id)
+        importedCount += 1
+      }
+      await refreshEntries()
+      setMessage(`Imported ${importedCount} ${importedCount === 1 ? 'entry' : 'entries'} from this browser.`)
+      window.setTimeout(() => setMessage(''), 5000)
+    } catch (importError) {
+      const detail = importError instanceof Error ? importError.message : 'The remaining entries could not be imported.'
+      let refreshDetail = ''
+      try {
+        await refreshEntries()
+      } catch (refreshError) {
+        refreshDetail = ` The cloud archive could not be refreshed: ${refreshError instanceof Error ? refreshError.message : 'unknown error'}.`
+      }
+      setError(`Imported ${importedCount} of ${unimportedEntries.length} entries. ${detail} You can retry the import.${refreshDetail}`)
+    } finally {
+      setImporting(false)
+    }
   }
 
   async function submitEntry(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!editingId && enteredCode !== entryCode) {
-      setError('Enter the correct entry code before posting.')
+    if (!user) {
+      setError('Sign in before adding or editing entries.')
       return
     }
 
@@ -102,39 +210,56 @@ function App() {
       body: draft.body.trim(),
       createdAt: existing?.createdAt ?? timestamp,
       updatedAt: timestamp,
+      ownerId: existing?.ownerId ?? user.id,
     }
 
     try {
-      await saveEntry(entry)
+      await saveEntry(entry, user.id)
       await refreshEntries()
       closeComposer()
-      setMessage(editingId ? 'Entry updated' : 'Entry added to the chronicle')
+      setMessage(editingId ? 'Entry updated' : 'Entry added to the public chronicle')
       window.setTimeout(() => setMessage(''), 2600)
       setError('')
-    } catch {
-      setError('Your entry could not be saved. Check browser storage and try again.')
+    } catch (saveError) {
+      let refreshDetail = ''
+      try {
+        await refreshEntries()
+      } catch (refreshError) {
+        refreshDetail = ` The chronicle could not be refreshed: ${refreshError instanceof Error ? refreshError.message : 'unknown error'}.`
+      }
+      setError(`${saveError instanceof Error ? saveError.message : 'Your entry could not be saved.'}${refreshDetail}`)
     }
   }
 
   async function removeEntry(entry: JournalEntry) {
+    if (!user || entry.ownerId !== user.id) return
     if (!window.confirm(`Remove “${entry.title}” from your chronicle?`)) return
     try {
-      await deleteEntry(entry.id)
+      await deleteEntry(entry.id, user.id)
       await refreshEntries()
       setMessage('Entry removed')
       window.setTimeout(() => setMessage(''), 2600)
-    } catch {
-      setError('This entry could not be removed.')
+    } catch (deleteError) {
+      let refreshDetail = ''
+      try {
+        await refreshEntries()
+      } catch (refreshError) {
+        refreshDetail = ` The chronicle could not be refreshed: ${refreshError instanceof Error ? refreshError.message : 'unknown error'}.`
+      }
+      setError(`${deleteError instanceof Error ? deleteError.message : 'This entry could not be removed.'}${refreshDetail}`)
     }
   }
 
   function addImages(event: ChangeEvent<HTMLInputElement>) {
     const selectedImages = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('image/'))
-    const files = selectedImages.filter((file) => file.size <= maxImageSize)
-    const oversizedCount = selectedImages.length - files.length
-    setImageWarning(oversizedCount > 0
-      ? `${oversizedCount} image${oversizedCount === 1 ? '' : 's'} exceeded 2 MB and ${oversizedCount === 1 ? 'was' : 'were'} not attached.`
-      : '')
+    const supportedImages = selectedImages.filter((file) => supportedImageTypes.has(file.type))
+    const files = supportedImages.filter((file) => file.size <= maxImageSize)
+    const warningParts: string[] = []
+    const unsupportedCount = selectedImages.length - supportedImages.length
+    const oversizedCount = supportedImages.length - files.length
+    if (unsupportedCount > 0) warningParts.push(`${unsupportedCount} image${unsupportedCount === 1 ? ' was' : 's were'} not supported. Use JPEG, PNG, WebP, GIF, or AVIF.`)
+    if (oversizedCount > 0) warningParts.push(`${oversizedCount} image${oversizedCount === 1 ? '' : 's'} exceeded 2 MB and ${oversizedCount === 1 ? 'was' : 'were'} not attached.`)
+    setImageWarning(warningParts.join(' '))
     setDraft((current) => ({
       ...current,
       attachments: [...current.attachments, ...files.map((file) => ({
@@ -156,14 +281,18 @@ function App() {
           <span className="brand-copy"><strong>STONE <em>&</em> STORY</strong><small>THE MOUNTAIN'S CHRONICLES</small></span>
         </a>
         <div className="topbar-right">
-          <span className="realm-label"><span className="status-dot" /> PERSONAL ARCHIVE</span>
-          <button className="button button-copper top-new" onClick={startNewEntry}><span aria-hidden="true">+</span> New entry</button>
+          <span className="realm-label"><span className="status-dot" /> PUBLIC CHRONICLE</span>
+          {user && <span className="account-email" title={user.email ?? ''}>{user.email}</span>}
+          {authReady && (user
+            ? <button className="button button-outline account-button" onClick={signOut}>Sign out</button>
+            : <button className="button button-outline account-button" onClick={() => setAuthOpen(true)} disabled={!isSupabaseConfigured}>Sign in to write</button>)}
+          {user && <button className="button button-copper top-new" onClick={startNewEntry}><span aria-hidden="true">+</span> New entry</button>}
         </div>
       </header>
 
       <div className="page-frame" id="top">
         <aside className="sidebar">
-          <div className="sidebar-heading">YOUR CHRONICLE</div>
+          <div className="sidebar-heading">THE CHRONICLE</div>
           <div className="nav-item nav-item-active"><span className="nav-icon">✦</span><span>Journey log</span><span className="nav-count">{entries.length}</span></div>
           <div className="sidebar-rule" />
           <div className="sidebar-heading">THE ROAD SO FAR</div>
@@ -181,8 +310,8 @@ function App() {
           <section className="page-intro">
             <div className="eyebrow"><span /> A DWARF'S TALE, ONE STEP AT A TIME</div>
             <div className="intro-row">
-              <div><h1>The Long Way Across <i>Azeroth</i></h1><p>Every road leaves a story. Keep yours here.</p></div>
-              <button className="button button-copper intro-new" onClick={startNewEntry}><span aria-hidden="true">+</span> Write an entry</button>
+              <div><h1>The Long Way Across <i>Azeroth</i></h1><p>Every road leaves a story. Read the tales and add your own.</p></div>
+              {user && <button className="button button-copper intro-new" onClick={startNewEntry}><span aria-hidden="true">+</span> Write an entry</button>}
             </div>
           </section>
 
@@ -193,6 +322,12 @@ function App() {
 
           {error && <div className="notice notice-error" role="alert">{error}</div>}
           {message && <div className="notice notice-success" role="status">{message}</div>}
+          {unimportedEntries.length > 0 && (
+            <section className="archive-import" aria-label="Import your previous entries">
+              <div><strong>Older entries found in this browser</strong><small>{unimportedEntries.length} {unimportedEntries.length === 1 ? 'entry is' : 'entries are'} not in the cloud archive yet.</small></div>
+              <button className="button button-outline" onClick={importLocalArchive} disabled={isImporting}>{isImporting ? 'Importing…' : 'Import browser archive'}</button>
+            </section>
+          )}
 
           {visibleEntries.length > 0 ? (
             <div className="entries-list">
@@ -200,7 +335,7 @@ function App() {
                 <article className="entry" key={entry.id}>
                   <div className="entry-rail"><span className="rail-dot" /><span className="rail-line" /></div>
                   <div className="entry-card">
-                    <div className="entry-meta"><time dateTime={entry.date}>{formatDate(entry.date)}</time><span className="entry-separator">·</span><span className="location"><span aria-hidden="true">⌖</span> {entry.location || 'Somewhere in Azeroth'}</span><div className="entry-actions"><button aria-label={`Edit ${entry.title}`} title="Edit entry" onClick={() => startEditing(entry)}>✎</button><button aria-label={`Delete ${entry.title}`} title="Delete entry" onClick={() => removeEntry(entry)}>×</button></div></div>
+                    <div className="entry-meta"><time dateTime={entry.date}>{formatDate(entry.date)}</time><span className="entry-separator">·</span><span className="location"><span aria-hidden="true">⌖</span> {entry.location || 'Somewhere in Azeroth'}</span>{user?.id === entry.ownerId && <div className="entry-actions"><button aria-label={`Edit ${entry.title}`} title="Edit entry" onClick={() => startEditing(entry)}>✎</button><button aria-label={`Delete ${entry.title}`} title="Delete entry" onClick={() => removeEntry(entry)}>×</button></div>}</div>
                     <h2>{entry.title}</h2>
                     <p className="entry-body">{entry.body}</p>
                     {entry.attachments.length > 0 && <div className="entry-photos">{entry.attachments.map((image) => <Photo key={image.id} attachment={image} className="entry-photo" />)}</div>}
@@ -215,11 +350,11 @@ function App() {
               <div className="eyebrow"><span /> {search ? 'NO MATCHES FOUND' : 'A FRESH PAGE'}</div>
               <h2>{search ? 'No trace of that tale.' : 'The first mark is yours.'}</h2>
               <p>{search ? 'Try another name, place, or passage from the road.' : 'The pack is cinched, the trail is open. Set down the first moment worth remembering.'}</p>
-              {!search && <button className="button button-outline" onClick={startNewEntry}>Begin the chronicle <span aria-hidden="true">→</span></button>}
+              {!search && (user || isSupabaseConfigured) && <button className="button button-outline" onClick={startNewEntry}>{user ? 'Begin the chronicle' : 'Sign in to write'} <span aria-hidden="true">→</span></button>}
             </section>
           )}
 
-          <footer className="page-footer"><span>THE MOUNTAIN KEEPS ITS OWN COUNSEL</span><span>✦</span><span>YOUR STORY, YOURS ALONE</span></footer>
+          <footer className="page-footer"><span>THE MOUNTAIN KEEPS ITS OWN COUNSEL</span><span>✦</span><span>THE CHRONICLE IS OPEN TO ALL</span></footer>
         </main>
       </div>
 
@@ -231,12 +366,25 @@ function App() {
               <div className="form-row"><label className="field">DATE<input type="date" required value={draft.date} onChange={(event) => setDraft({ ...draft, date: event.target.value })} /></label><label className="field">PLACE<input value={draft.location} onChange={(event) => setDraft({ ...draft, location: event.target.value })} placeholder="e.g. The Great Forge" maxLength={70} /></label></div>
               <label className="field">ENTRY TITLE<input autoFocus required value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="What happened out there?" maxLength={100} /></label>
               <label className="field">THE TALE<textarea required rows={7} value={draft.body} onChange={(event) => setDraft({ ...draft, body: event.target.value })} placeholder="The road, the company, the moment you want to keep..." maxLength={6000} /></label>
-              {!editingId && <label className="field">ENTRY CODE<input type="password" inputMode="numeric" pattern="[0-9]{4}" autoComplete="off" required maxLength={4} value={enteredCode} onChange={(event) => setEnteredCode(event.target.value.replace(/\D/g, '').slice(0, 4))} aria-describedby="entry-code-hint" /><small id="entry-code-hint" className={enteredCode.length === 4 && enteredCode !== entryCode ? 'code-hint code-hint-error' : 'code-hint'}>{enteredCode.length === 4 && enteredCode !== entryCode ? 'That code does not match.' : 'Enter the four-digit code to enable posting.'}</small></label>}
               <div className="attachment-heading"><span className="field-caption">KEEPSAKES</span><span className="attachment-hint">{draft.attachments.length} attached</span></div>
               <p className="image-size-warning">Maximum image size: 2 MB per image.</p>
               {imageWarning && <p className="image-size-warning image-size-warning-error" role="alert">{imageWarning}</p>}
               {draft.attachments.length > 0 && <div className="draft-photos">{draft.attachments.map((image) => <div className="draft-photo-wrap" key={image.id}><Photo attachment={image} className="draft-photo" /><button type="button" onClick={() => removeImage(image.id)} aria-label={`Remove ${image.name}`}>×</button></div>)}</div>}
-              <div className="composer-bottom"><label className="button button-outline upload-button"><span aria-hidden="true">▧</span> Add images<input type="file" accept="image/*" multiple onChange={addImages} /></label><span className="local-note">Images stay in this browser</span><button className="button button-copper save-button" type="submit" disabled={!editingId && enteredCode !== entryCode}>{editingId ? 'Save changes' : 'Carve Entry'} <span aria-hidden="true">→</span></button></div>
+              <div className="composer-bottom"><label className="button button-outline upload-button"><span aria-hidden="true">▧</span> Add images<input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" multiple onChange={addImages} /></label><span className="local-note">Images saved with the chronicle</span><button className="button button-copper save-button" type="submit">{editingId ? 'Save changes' : 'Carve Entry'} <span aria-hidden="true">→</span></button></div>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {isAuthOpen && (
+        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAuthOpen(false) }}>
+          <section className="composer auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+            <div className="composer-header"><div><div className="eyebrow"><span /> THE CHRONICLE</div><h2 id="auth-title">Sign in to write</h2></div><button className="close-button" onClick={() => setAuthOpen(false)} aria-label="Close sign in">×</button></div>
+            <p className="auth-explanation">Enter your email and we’ll send a one-time sign-in link. You can read the public archive without signing in.</p>
+            {error && <div className="notice notice-error" role="alert">{error}</div>}
+            <form onSubmit={requestSignIn}>
+              <label className="field">EMAIL ADDRESS<input type="email" autoComplete="email" autoFocus required value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" /></label>
+              <div className="composer-bottom"><button type="button" className="button button-outline" onClick={() => setAuthOpen(false)}>Cancel</button><button className="button button-copper save-button" type="submit" disabled={isSendingLink}>{isSendingLink ? 'Sending…' : 'Email me a sign-in link'}</button></div>
             </form>
           </section>
         </div>

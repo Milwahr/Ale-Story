@@ -1,7 +1,7 @@
 # Stone & Story Project Notes
 
 - This is a Vite, React, and TypeScript journey diary with a dwarven fantasy visual style.
-- Store journal entries and image blobs in the browser's IndexedDB. Do not imply that entries sync or upload.
+- Store public journal entries in Supabase Postgres and image blobs in Supabase Storage. Only signed-in authors can create, edit, or delete their entries; never expose a Supabase service-role key in the browser.
 - Keep post creation, editing, deletion, search, and image attachments usable on desktop and mobile.
 - Run locally with `npm install` and `npm run dev`; verify production output with `npm run build`.
 
